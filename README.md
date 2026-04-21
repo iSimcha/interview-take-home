@@ -78,7 +78,7 @@ Your job is to produce a linked view of the data.
    - What you would do next with another day of work.
 
 3. **Tests** demonstrating your linking logic works on at least a few representative cases (clear match, near-miss
-   non-match, ambiguous match). Pytest is already configured.
+   non-match, ambiguous match). Pytest is already configured. 4-6 tests is sufficient.
 
 You may use any open source libraries you like: `rapidfuzz`, `recordlinkage`, `splink`, `dedupe`, `usaddress`,
 `nameparser`, `pandas`, pure SQL with `pg_trgm` / `fuzzystrmatch` / `unaccent` (all three extensions are already
@@ -105,7 +105,7 @@ group; you are not required to use any of them.
 ## Submitting
 
 Fork this repository on GitHub, create a branch for your work, and open a pull request back to this repo when you are
-ready for review. Include your write-up as `SOLUTION.md` in the repo root. If you iterated on your approach, your
-commit history is welcome; we welcome your creativity.
+ready for review. Include your write-up as `SOLUTION.md` in the repo root. If you iterated on your approach, your commit
+history is welcome; we welcome your creativity.
 
 Questions? Reach out at any point. Good luck.
