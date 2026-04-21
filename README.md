@@ -4,7 +4,7 @@ Thank you for your time. This assessment is designed to give you a realistic sli
 every day: assembling a single, trustworthy view of real-world entities from multiple public data feeds that were never
 designed to be linked together.
 
-Budget roughly **4 hours** of focused work. If you finish faster, great; if a piece takes longer, document what you
+Budget roughly **2 hours** of focused work. If you finish faster, great; if a piece takes longer, document what you
 would have done next rather than rushing. We care about how you think and the quality of your approach, not about
 completing every possible improvement.
 
