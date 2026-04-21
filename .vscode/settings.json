@@ -1,0 +1,13 @@
+{
+  "pgsql.connections": [
+    {
+      "profileName": "localhost",
+      "server": "localhost",
+      "port": "5432",
+      "database": "postgres",
+      "user": "postgres",
+      "password": "",
+      "authenticationType": "SqlLogin"
+    }
+  ]
+}

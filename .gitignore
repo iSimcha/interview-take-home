@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+
+# NOTE: ./postgres-data/ is intentionally NOT ignored. The repo ships with a
+# pre-populated PostgreSQL data directory so that `docker compose up` starts
+# a database that already contains the source tables and seed data. To keep
+# transient runtime files out of the commit, individual subpaths can be
+# ignored here once we settle on what PG writes during normal use.

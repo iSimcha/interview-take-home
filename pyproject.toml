@@ -1,0 +1,36 @@
+[project]
+name = "isimcha-entity-linking-assessment"
+version = "0.1.0"
+description = "iSimcha take-home assessment: link records across three public data sources with no common key."
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+# Suggested libraries a candidate may reach for. These are not installed by
+# default — pick what you need and add to `dependencies` in your own fork.
+suggested = [
+    "pandas>=2.0",
+    "rapidfuzz>=3.0",
+    "recordlinkage>=0.16",
+    "splink>=4.0",
+    "usaddress>=0.5",
+    "nameparser>=1.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
