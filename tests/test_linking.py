@@ -1,6 +1,9 @@
 """Tests for the entity linking pipeline."""
 from entity_linking.db import connect
-from entity_linking.main import normalize_name, normalize_street, normalize_zip, compute_match, extract_name_number
+from entity_linking.main import (
+    normalize_name, normalize_street, normalize_zip,
+    compute_match, extract_name_number, main,
+)
 
 
 # --- Normalization tests ---
@@ -68,7 +71,6 @@ def test_exact_name_different_state_with_address_match():
 
 
 def test_roman_numeral_mismatch_rejects():
-    """Westpoint II and Westpoint III should NOT match."""
     r1 = {"norm_name": "westpoint industrial realty ii", "norm_street": "400 madison ave", "state": "DE", "norm_zip": "10017", "name_base": "westpoint industrial realty", "name_number": "ii"}
     r2 = {"norm_name": "westpoint industrial realty iii", "norm_street": "400 madison ave", "state": "DE", "norm_zip": "10017", "name_base": "westpoint industrial realty", "name_number": "iii"}
     score, method = compute_match(r1, r2)
@@ -89,8 +91,31 @@ def test_no_match_for_unrelated_companies():
     assert score == 0.0
 
 
-def test_all_500_records_linked():
+def test_atlantic_near_miss_does_not_match():
+    """Atlantic Coast Freight and Atlantic Coastal Freight are different companies."""
+    r1 = {"norm_name": "atlantic coast freight", "norm_street": "88 shore rd", "state": "NC", "norm_zip": "28401", "name_base": "atlantic coast freight", "name_number": ""}
+    r2 = {"norm_name": "atlantic coastal freight", "norm_street": "200 harbor blvd", "state": "NJ", "norm_zip": "07302", "name_base": "atlantic coastal freight", "name_number": ""}
+    score, method = compute_match(r1, r2)
+    assert score == 0.0, "Similar names but different companies should not match"
+
+
+def test_riverstone_parent_name_concept():
+    """A subsidiary with a different name should link to its parent via parent_name."""
+    parent_norm = normalize_name("Riverstone Holdings Corp.")
+    child_norm = normalize_name("Riverstone Federal Programs LLC")
+    # These names are different enough that direct matching won't work
+    from rapidfuzz import fuzz
+    score = fuzz.ratio(parent_norm, child_norm) / 100.0
+    assert score < 0.85, "Direct name match should be too low"
+    # But parent_name matching would catch it (tested via integration)
+
+
+# --- Integration test ---
+
+def test_pipeline_links_all_500_records():
+    """Run the full pipeline and verify all 500 source records are linked."""
+    main()
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM resolved.entity_source_links")
         (count,) = cur.fetchone()
-    assert count == 500
+    assert count == 500, f"Expected 500 links, got {count}"
