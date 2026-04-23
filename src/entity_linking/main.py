@@ -20,6 +20,9 @@ LEGAL_SUFFIXES = [
     r',?\s*a cooperative$',
 ]
 
+# Roman numeral pattern for detecting numbered entities like "Realty II" vs "Realty III"
+ROMAN_NUMERAL = re.compile(r'\b(ii|iii|iv|v|vi|vii|viii|ix|x|\d+)\s*$')
+
 
 def normalize_name(name: str) -> str:
     if not name:
@@ -30,6 +33,16 @@ def normalize_name(name: str) -> str:
         n = re.sub(pattern, "", n, flags=re.IGNORECASE)
     n = re.sub(r"\s+", " ", n).strip()
     return n
+
+
+def extract_name_number(norm_name: str) -> tuple[str, str]:
+    """Split a normalized name into base name and trailing number/roman numeral."""
+    m = ROMAN_NUMERAL.search(norm_name)
+    if m:
+        base = norm_name[:m.start()].strip()
+        num = m.group(1)
+        return base, num
+    return norm_name, ""
 
 
 def normalize_zip(z: str) -> str:
@@ -64,6 +77,7 @@ def load_all_records(conn) -> list[dict]:
                 "source": "sec", "source_id": str(row[0]),
                 "name": row[1] or "", "street": row[2] or "",
                 "city": row[3] or "", "state": row[4] or "", "zip": row[5] or "",
+                "parent_name": "",
             })
 
         cur.execute("SELECT registration_id, entity_name, agent_street, agent_city, agent_state, agent_zip FROM sources.state_registrations")
@@ -72,20 +86,26 @@ def load_all_records(conn) -> list[dict]:
                 "source": "state", "source_id": row[0],
                 "name": row[1] or "", "street": row[2] or "",
                 "city": row[3] or "", "state": row[4] or "", "zip": row[5] or "",
+                "parent_name": "",
             })
 
-        cur.execute("SELECT uei, recipient_name, street, city, state, zip_code FROM sources.usaspending_recipients")
+        cur.execute("SELECT uei, recipient_name, parent_name, street, city, state, zip_code FROM sources.usaspending_recipients")
         for row in cur.fetchall():
             records.append({
                 "source": "usaspending", "source_id": row[0],
-                "name": row[1] or "", "street": row[2] or "",
-                "city": row[3] or "", "state": row[4] or "", "zip": row[5] or "",
+                "name": row[1] or "", "street": row[3] or "",
+                "city": row[4] or "", "state": row[5] or "", "zip": row[6] or "",
+                "parent_name": row[2] or "",
             })
 
     for r in records:
         r["norm_name"] = normalize_name(r["name"])
         r["norm_street"] = normalize_street(r["street"])
         r["norm_zip"] = normalize_zip(r["zip"])
+        r["norm_parent"] = normalize_name(r["parent_name"]) if r["parent_name"] else ""
+        base, num = extract_name_number(r["norm_name"])
+        r["name_base"] = base
+        r["name_number"] = num
 
     return records
 
@@ -116,44 +136,58 @@ def compute_match(r1: dict, r2: dict) -> tuple[float, str]:
     token_score = fuzz.token_sort_ratio(r1["norm_name"], r2["norm_name"]) / 100.0
     best_name = max(name_score, token_score)
 
-    
+    # If both have trailing numbers/roman numerals and they differ, never match
+    if r1["name_number"] and r2["name_number"] and r1["name_number"] != r2["name_number"]:
+        return (0.0, "")
+
+    # Address and state checks
+    street_score = 0.0
+    if r1["norm_street"] and r2["norm_street"]:
+        street_score = fuzz.ratio(r1["norm_street"], r2["norm_street"]) / 100.0
+    same_state = (not r1["state"] or not r2["state"] or r1["state"] == r2["state"])
+    address_confirms = street_score > 0.7
+
     # Exact normalized name
     if r1["norm_name"] == r2["norm_name"] and r1["norm_name"] != "":
-        if r1["state"] and r2["state"] and r1["state"] != r2["state"]:
-            if r1["norm_street"] and r2["norm_street"]:
-                street_score = fuzz.ratio(r1["norm_street"], r2["norm_street"]) / 100.0
-                if street_score > 0.7:
-                    return (0.95, "exact_name_confirmed_address")
-            # Same name, different state, different address: don't match
-            return (0.0, "")
-        return (1.0, "exact_name")
+        if same_state:
+            return (1.0, "exact_name")
+        if address_confirms:
+            return (0.95, "exact_name_confirmed_address")
+        return (0.0, "")
 
+    # For fuzzy matches, check if the names differ by a real word (not just suffix)
+    # Split into words and check overlap
+    words1 = set(r1["norm_name"].split())
+    words2 = set(r2["norm_name"].split())
+    missing_words = words1.symmetric_difference(words2)
 
-    # High fuzzy name match (>=85%)
+    # If the only differences are small words like "and", "of", "the", allow it
+    filler_words = {"and", "of", "the", "for", "a", "an"}
+    meaningful_diff = missing_words - filler_words
+
+    # High fuzzy match (>=85%)
     if best_name >= 0.85:
+        # If there's a meaningful word difference (like "coastal" vs "coast"),
+        # require address confirmation to match
+        if meaningful_diff and not address_confirms:
+            return (0.0, "")
+
         method = "fuzzy_name"
         score = best_name
 
-        if r1["norm_street"] and r2["norm_street"]:
-            street_score = fuzz.ratio(r1["norm_street"], r2["norm_street"]) / 100.0
-            if street_score > 0.7:
-                score = min(score + 0.1, 1.0)
-                method = "fuzzy_name_confirmed_address"
-
-        if r1["state"] and r2["state"] and r1["state"] != r2["state"]:
-            if "confirmed_address" not in method:
-                score -= 0.15
-                method = "fuzzy_name_diff_state"
+        if address_confirms:
+            score = min(score + 0.1, 1.0)
+            method = "fuzzy_name_confirmed_address"
+        elif not same_state:
+            return (0.0, "")
 
         if score >= 0.70:
             return (round(score, 3), method)
 
-    # Medium name match but strong address confirmation
+    # Medium fuzzy name match (>=65%) with strong address in same state
     if best_name >= 0.65:
-        if r1["norm_street"] and r2["norm_street"]:
-            street_score = fuzz.ratio(r1["norm_street"], r2["norm_street"]) / 100.0
-            if street_score > 0.8 and r1["state"] == r2["state"]:
-                return (round(best_name + 0.1, 3), "medium_name_strong_address")
+        if street_score > 0.8 and same_state:
+            return (round(best_name + 0.1, 3), "medium_name_strong_address")
 
     return (0.0, "")
 
@@ -163,6 +197,7 @@ def match_all_records(records: list[dict]) -> tuple[UnionFind, dict]:
     uf = UnionFind(n)
     match_info = {}
 
+    # Standard pairwise matching
     for i in range(n):
         for j in range(i + 1, n):
             score, method = compute_match(records[i], records[j])
@@ -171,6 +206,20 @@ def match_all_records(records: list[dict]) -> tuple[UnionFind, dict]:
                 key = (min(i, j), max(i, j))
                 if key not in match_info or score > match_info[key][0]:
                     match_info[key] = (score, method)
+
+    # Parent name linking: match USAspending parent_name to other records
+    for i in range(n):
+        if records[i]["norm_parent"] and records[i]["norm_parent"] != records[i]["norm_name"]:
+            for j in range(n):
+                if i == j:
+                    continue
+                parent_score = fuzz.ratio(records[i]["norm_parent"], records[j]["norm_name"]) / 100.0
+                if parent_score >= 0.85:
+                    uf.union(i, j)
+                    key = (min(i, j), max(i, j))
+                    s = round(parent_score, 3)
+                    if key not in match_info or s > match_info[key][0]:
+                        match_info[key] = (s, "parent_name_link")
 
     return uf, match_info
 
@@ -183,6 +232,13 @@ def pick_canonical_name(cluster_records: list[dict]) -> str:
     best_source = sorted_recs[0]["source"]
     same_source = [r for r in sorted_recs if r["source"] == best_source]
     return max(same_source, key=lambda r: len(r["name"]))["name"]
+
+
+def make_entity_id(members: list[tuple[int, dict]]) -> str:
+    """Generate a deterministic UUID based on sorted source keys."""
+    parts = sorted(f"{rec['source']}:{rec['source_id']}" for _, rec in members)
+    name = "|".join(parts)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, name))
 
 
 def write_results(conn, records: list[dict], uf: UnionFind, match_info: dict):
@@ -199,7 +255,7 @@ def write_results(conn, records: list[dict], uf: UnionFind, match_info: dict):
             cluster_records = [rec for _, rec in members]
             canonical = pick_canonical_name(cluster_records)
 
-            entity_id = str(uuid.uuid4())
+            entity_id = make_entity_id(members)
             sources_present = set(r["source"] for r in cluster_records)
             notes = f"Sources: {', '.join(sorted(sources_present))}. {len(members)} record(s)."
 
@@ -237,7 +293,6 @@ def write_results(conn, records: list[dict], uf: UnionFind, match_info: dict):
         conn.commit()
 
 
-# --- Main ---
 
 def main() -> None:
     print("Loading records...")

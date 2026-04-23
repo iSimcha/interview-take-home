@@ -4,44 +4,48 @@
 
 The pipeline works in four stages:
 
-1. **Load and normalize**: Pull all 500 records from the three source tables into a common format. Normalize company names by lowercasing, stripping legal suffixes (Inc, Corp, LLC, etc.), replacing "&" with "and", and removing punctuation. Normalize addresses by abbreviating street types (Boulevard -> Blvd, etc.) and stripping suite/floor info. Normalize ZIP codes to 5 digits.
+1. **Load and normalize**: Pull all 500 records from the three source tables into a common format. Normalize company names by lowercasing, stripping legal suffixes (Inc, Corp, LLC, etc.), replacing "&" with "and", and removing punctuation. Normalize addresses by abbreviating street types (Boulevard -> Blvd, etc.) and stripping suite/floor info. Normalize ZIP codes to 5 digits. Extract trailing Roman numerals or numbers from names to prevent false merges (e.g., "Realty II" vs "Realty III").
 
-2. **Pairwise matching**: Compare every pair of records using fuzzy string matching (rapidfuzz). The matching logic uses a tiered scoring system:
+2. **Pairwise matching**: Compare every pair of records using fuzzy string matching (rapidfuzz). The matching uses a tiered scoring system:
    - **Exact normalized name, same state** -> score 1.0
    - **Exact name, different state, confirmed by matching address** -> score 0.95
-   - **Exact name, different state, no address match** -> no match (prevents false merges of distinct companies with similar names)
-   - **High fuzzy name match (>=85%)** -> score based on similarity, boosted if address confirms, penalized if states differ without address confirmation
-   - **Medium fuzzy match (>=65%) with strong address match** -> match with moderate confidence
+   - **Exact name, different state, no address match** -> no match (prevents false merges of companies with common names in different states)
+   - **High fuzzy match (>=85%) with only filler word differences** -> match if same state or address confirms
+   - **High fuzzy match with meaningful word differences** -> only match with address confirmation
+   - **Medium fuzzy match (>=65%) with strong address match in same state** -> match with moderate confidence
+   - **Different trailing numbers/roman numerals** -> never match regardless of name similarity
 
-3. **Clustering**: Use Union-Find to group matched records into clusters. Each cluster represents one real-world entity.
+3. **Parent name linking**: USAspending records include a `parent_name` field. After standard matching, the pipeline links USAspending subsidiaries to their parent entities by fuzzy matching `parent_name` against all other normalized names.
 
-4. **Write results**: For each cluster, pick a canonical name (preferring SEC names as the most formal), create an entity row, and link all source records to it with their match scores and methods.
+4. **Clustering and output**: Use Union-Find to group matched records into clusters. For each cluster, pick a canonical name (preferring SEC names as the most formal source), generate a deterministic entity ID using uuid5, and write to the resolved tables.
 
 ## Trade-offs
 
-- **Precision over recall**: I chose to reject same-name matches when states differ and addresses don't confirm. This means we might miss a few real matches (e.g., a company that moved), but we avoid incorrectly merging two unrelated companies that happen to share a common name. For a system that needs to be trustworthy, false merges are worse than missed links.
+- **Precision over recall**: I reject same-name matches across states when addresses don't confirm. This might miss real matches where a company moved, but it avoids merging unrelated companies that share a common name (like Summit Consulting Group in DC vs CO).
 
-- **O(n^2) pairwise comparison**: With 500 records, comparing all pairs (~125k comparisons) runs in a few seconds. This wouldn't scale to millions of records, but for this dataset it's simple and correct. With more time, I'd add blocking (only compare records that share the same state or first few characters of the name) to reduce comparisons.
+- **Word-level diff checking**: Instead of relying purely on fuzzy scores, I check whether names differ by meaningful words or just filler words ("and", "of", "the"). "Baker and Holt" vs "Baker Holt" differs only by a filler word, so it matches. "Atlantic Coastal Freight" vs "Atlantic Coast Freight" differs by a meaningful word, so it requires address confirmation.
 
-- **Name normalization vs. matching**: I strip legal suffixes during normalization rather than during matching. This means "ACME SEMICONDUCTOR CORP" and "Acme Semiconductor Corporation" normalize to the same string and get an exact match. The downside is we lose the signal that one says "Corp" and the other says "Corporation", but in practice that distinction doesn't indicate different entities.
+- **O(n^2) pairwise comparison**: With 500 records this runs in seconds. For larger datasets I'd add blocking to reduce comparisons.
 
 ## Hard Cases
 
-1. **Summit Consulting Group**: Appears as both "Summit Consulting Group Inc" (DC, 700 K Street) and "Summit Consulting Group LLC" (CO, 450 Mountain Rd). After normalization, both become "summit consulting group". My initial pass merged them into one entity. I fixed this by rejecting exact-name matches where states differ and addresses don't confirm. Now they're correctly split into two entities.
+1. **Summit Consulting Group**: Two different entities share the same base name. "Summit Consulting Group Inc" (DC) and "Summit Consulting Group LLC" (CO) are separate companies. After suffix removal both normalize to "summit consulting group". Solved by rejecting exact-name matches across states without address confirmation. The USAspending records link correctly because they share addresses with their respective SEC records.
 
-2. **Fulton Pharmaceuticals / Fulton Pharma**: The USAspending record uses "FULTON PHARMA", a significant abbreviation of "FULTON PHARMACEUTICALS, INC." The fuzzy name score alone (~68%) isn't high enough to match confidently, but the address match ("22 Technology Way", Newark, NJ) confirms the link. This is handled by the medium-name-strong-address tier, scoring 0.84.
+2. **Atlantic Coast vs Atlantic Coastal Freight**: Two genuinely different companies with very similar names (~96% fuzzy match). "Atlantic Coast Freight" operates in NC, "Atlantic Coastal Freight" operates in NJ. Solved by checking word-level differences: "coastal" vs "coast" is a meaningful word change, so address confirmation is required, and their addresses don't match.
 
-3. **Atlantic Coast Freight vs. Atlantic Coastal Freight**: These are actually two different SEC records (CIK 1001316 and 1001275) with slightly different names and different addresses (Raleigh, NC vs. Princeton, NJ). The normalized names are similar but not identical ("atlantic coast freight" vs "atlantic coastal freight"), and the different addresses/states prevent a false merge.
+3. **Westpoint Industrial Realty II vs III**: Same base name, different Roman numeral suffix. The pipeline extracts trailing numerals and blocks matches when they differ, regardless of how similar the rest of the name is.
+
+4. **Riverstone Federal Programs / Riverstone Holdings**: The USAspending record for "Riverstone Federal Programs LLC" has a `parent_name` of "Riverstone Holdings Corp." The parent name linking step catches this and links the subsidiary to the parent entity.
 
 ## What I'd Do Next
 
-- **Blocking**: Add a blocking step to only compare records that share the first 3-4 characters of the normalized name or the same state. This would reduce the number of comparisons from O(n^2) to something more manageable for larger datasets.
+- **Blocking**: Only compare records sharing the first few characters of the normalized name or the same state, reducing comparisons from O(n^2).
 
-- **Address parsing**: Use the `usaddress` library to properly parse addresses into components (street number, street name, city, state, zip) for more precise address comparison instead of fuzzy matching the full string.
+- **Address parsing**: Use `usaddress` to parse addresses into components (street number, street name, city) for more precise comparison.
 
-- **Confidence review**: Build a simple report of low-confidence matches (score 0.7-0.85) for human review. In production, you'd want a human-in-the-loop step for ambiguous cases.
+- **Confidence review**: Generate a report of low-confidence matches (0.70-0.85) for human review.
 
-- **Incremental updates**: Currently the pipeline does a full rebuild. For production use, I'd add incremental matching so new records can be linked without reprocessing everything.
+- **Incremental updates**: Support adding new records without reprocessing the full dataset.
 
 ## Final Thoughts
 
