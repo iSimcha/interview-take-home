@@ -67,6 +67,30 @@ STREET_NORMALIZATIONS = {
 
 SOURCE_PRIORITY = {"sec": 0, "usaspending": 1, "state": 2}
 
+NAME_WEIGHT = 0.65
+STREET_WEIGHT = 0.10
+CITY_WEIGHT = 0.10
+STATE_WEIGHT = 0.10
+ZIP_WEIGHT = 0.05
+
+STRONG_STREET_THRESHOLD = 0.90
+EXACT_CITY_THRESHOLD = 0.90
+FUZZY_NAME_ZIP_THRESHOLD = 0.94
+FUZZY_NAME_CITY_THRESHOLD = 0.97
+FUZZY_CITY_THRESHOLD = 0.85
+ROMAN_NUMERAL_TOKENS = {
+    "I",
+    "II",
+    "III",
+    "IV",
+    "V",
+    "VI",
+    "VII",
+    "VIII",
+    "IX",
+    "X",
+}
+
 
 @dataclass(frozen=True)
 class SourceRecord:
@@ -174,7 +198,16 @@ def similarity(left: str, right: str) -> float:
     return SequenceMatcher(a=left, b=right).ratio()
 
 
+def trailing_roman_numeral(value: str) -> str:
+    tokens = value.split()
+    if not tokens:
+        return ""
+    return tokens[-1] if tokens[-1] in ROMAN_NUMERAL_TOKENS else ""
+
+
 def compare_records(left: SourceRecord, right: SourceRecord) -> MatchDecision:
+    # These rule-based thresholds are deterministic by design: the same inputs
+    # always yield the same match score and method tag.
     if left.source_system == right.source_system:
         return MatchDecision(False, 0.0, "cross_source_only")
 
@@ -184,27 +217,43 @@ def compare_records(left: SourceRecord, right: SourceRecord) -> MatchDecision:
     same_state = bool(left.state_key and left.state_key == right.state_key)
     same_zip = bool(left.zip_key and left.zip_key == right.zip_key)
     exact_name = bool(left.name_key and left.name_key == right.name_key)
-    strong_street_match = bool(left.street_key and right.street_key and street_similarity >= 0.9)
+    left_roman = trailing_roman_numeral(left.name_key)
+    right_roman = trailing_roman_numeral(right.name_key)
+    strong_street_match = bool(
+        left.street_key and right.street_key and street_similarity >= STRONG_STREET_THRESHOLD
+    )
+
+    if left_roman and right_roman and left_roman != right_roman:
+        return MatchDecision(False, 0.0, "roman_numeral_mismatch")
 
     score = round(
         min(
-            (0.65 * name_similarity)
-            + (0.1 * street_similarity)
-            + (0.1 * city_similarity)
-            + (0.1 if same_state else 0.0)
-            + (0.05 if same_zip else 0.0),
+            (NAME_WEIGHT * name_similarity)
+            + (STREET_WEIGHT * street_similarity)
+            + (CITY_WEIGHT * city_similarity)
+            + (STATE_WEIGHT if same_state else 0.0)
+            + (ZIP_WEIGHT if same_zip else 0.0),
             0.999,
         ),
         3,
     )
 
-    if exact_name and same_state and (same_zip or strong_street_match or city_similarity >= 0.9):
+    if exact_name and same_state and (same_zip or strong_street_match or city_similarity >= EXACT_CITY_THRESHOLD):
         return MatchDecision(True, max(score, 0.985), "exact_name_state")
-    if exact_name and same_zip and (strong_street_match or city_similarity >= 0.9):
+    if exact_name and same_zip and (strong_street_match or city_similarity >= EXACT_CITY_THRESHOLD):
         return MatchDecision(True, max(score, 0.975), "exact_name_zip_city")
-    if name_similarity >= 0.94 and same_state and same_zip and (strong_street_match or city_similarity >= 0.85):
+    if (
+        name_similarity >= FUZZY_NAME_ZIP_THRESHOLD
+        and same_state
+        and same_zip
+        and (strong_street_match or city_similarity >= FUZZY_CITY_THRESHOLD)
+    ):
         return MatchDecision(True, max(score, 0.955), "fuzzy_name_state_zip")
-    if name_similarity >= 0.97 and same_state and (strong_street_match or city_similarity >= 0.85):
+    if (
+        name_similarity >= FUZZY_NAME_CITY_THRESHOLD
+        and same_state
+        and (strong_street_match or city_similarity >= FUZZY_CITY_THRESHOLD)
+    ):
         return MatchDecision(True, max(score, 0.95), "fuzzy_name_city_state")
 
     return MatchDecision(False, score, "singleton")

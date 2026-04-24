@@ -77,8 +77,7 @@ def main() -> None:
         records = load_source_records(cur)
         entities, links = build_resolved_entities(records)
 
-        cur.execute("DELETE FROM resolved.entity_source_links")
-        cur.execute("DELETE FROM resolved.entities")
+        cur.execute("TRUNCATE TABLE resolved.entity_source_links, resolved.entities")
 
         cur.executemany(
             """
