@@ -11,23 +11,27 @@ This skeleton deliberately leaves the linking logic unimplemented.
 from __future__ import annotations
 
 from entity_linking.db import connect
+from entity_linking.pipeline import run_pipeline
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy")
 
+def main() -> None:    
+    with connect() as conn:
+        sec_df = pd.read_sql("""SELECT cik, company_name, street, city, state, zip_code 
+                            FROM sources.sec_companies
+                            """, conn)
 
-def main() -> None:
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM sources.sec_companies")
-        (sec_count,) = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM sources.state_registrations")
-        (state_count,) = cur.fetchone()
-        cur.execute("SELECT COUNT(*) FROM sources.usaspending_recipients")
-        (usasp_count,) = cur.fetchone()
+        state_df = pd.read_sql("""SELECT registration_id, entity_name, agent_street, agent_city, agent_state, agent_zip
+                               FROM sources.state_registrations
+                               """, conn)
 
-    print(f"sources.sec_companies:           {sec_count} rows")
-    print(f"sources.state_registrations:     {state_count} rows")
-    print(f"sources.usaspending_recipients:  {usasp_count} rows")
-    print()
-    print("Next step: implement your linking pipeline and populate resolved.entities + resolved.entity_source_links.")
+        usa_df = pd.read_sql("""SELECT uei, recipient_name, parent_name, street, city, state, zip_code
+                            FROM sources.usaspending_recipients
+                            """, conn)
 
+        run_pipeline(conn, sec_df, state_df, usa_df)
+    print("Entity linking pipeline completed.")
 
 if __name__ == "__main__":
     main()
