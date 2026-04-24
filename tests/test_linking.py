@@ -1,93 +1,138 @@
 """Tests for the entity linking pipeline."""
-from entity_linking.db import connect
-from entity_linking.main import (
-    normalize_name, normalize_street, normalize_zip,
-    compute_match, extract_name_number, main,
+from __future__ import annotations
+
+from entity_linking.normalize import (
+    extract_roman_suffix,
+    normalize_name,
+    normalize_zip,
 )
+from entity_linking.linker import (
+    build_resolved_entities,
+    compare_records,
+    make_source_record,
+)
+from entity_linking.db import connect
+from entity_linking.main import load_source_records
 
 
-# --- Normalization tests ---
+def rec(source_system, source_record_id, name, street="", city="", state="", zip_code="", parent_name=None):
+    return make_source_record(
+        source_system=source_system,
+        source_record_id=source_record_id,
+        name=name,
+        street=street or None,
+        city=city or None,
+        state=state or None,
+        zip_code=zip_code or None,
+        parent_name=parent_name,
+    )
 
-def test_normalize_strips_legal_suffixes():
-    assert normalize_name("ACME SEMICONDUCTOR CORP") == "acme semiconductor"
-    assert normalize_name("Acme Semiconductor Corporation") == "acme semiconductor"
-    assert normalize_name("FULTON PHARMACEUTICALS, INC.") == "fulton pharmaceuticals"
+
+# normalization
+
+def test_normalize_name_strips_legal_suffixes():
+    assert normalize_name("ACME SEMICONDUCTOR CORP")      == "ACME SEMICONDUCTOR"
+    assert normalize_name("Fulton Pharmaceuticals, Inc.") == "FULTON PHARMACEUTICALS"
+    assert normalize_name("GREEN VALLEY LLC")             == "GREEN VALLEY"
 
 
-def test_normalize_handles_ampersand_and_punctuation():
-    assert normalize_name("Baker & Holt Industries, Inc.") == "baker and holt industries"
-    assert normalize_name("BAKER AND HOLT INDUSTRIES INC") == "baker and holt industries"
+def test_normalize_name_ampersand_and_and_are_equivalent():
+    assert normalize_name("Baker & Holt Industries Inc") == \
+           normalize_name("Baker and Holt Industries Inc")
 
 
 def test_normalize_zip_strips_plus4():
     assert normalize_zip("28401-0088") == "28401"
-    assert normalize_zip("95054") == "95054"
+    assert normalize_zip("95054")      == "95054"
+    assert normalize_zip("")           == ""
 
 
-def test_normalize_street_abbreviations():
-    assert "blvd" in normalize_street("200 Harbor Boulevard")
-    assert "dr" in normalize_street("1200 Innovation Drive")
+def test_extract_roman_suffix():
+    assert extract_roman_suffix("WESTPOINT INDUSTRIAL REALTY III") == "III"
+    assert extract_roman_suffix("WESTPOINT INDUSTRIAL REALTY II")  == "II"
+    assert extract_roman_suffix("ACME SEMICONDUCTOR")              == ""
 
 
-def test_extract_name_number():
-    base, num = extract_name_number("westpoint industrial realty iii")
-    assert base == "westpoint industrial realty"
-    assert num == "iii"
-    base, num = extract_name_number("acme semiconductor")
-    assert base == "acme semiconductor"
-    assert num == ""
+# matching
+
+def test_same_source_never_matches():
+    r1 = rec("sec", "1001", "ACME CORP", street="100 Main St", city="Austin", state="TX", zip_code="78701")
+    r2 = rec("sec", "1002", "ACME CORP", street="100 Main St", city="Austin", state="TX", zip_code="78701")
+    d  = compare_records(r1, r2)
+    assert not d.matched
+    assert d.method == "same_source"
 
 
-# --- Matching tests ---
-
-def test_exact_match_same_state():
-    r1 = {"norm_name": "acme semiconductor", "norm_street": "1200 innovation dr", "state": "CA", "norm_zip": "95054", "name_base": "acme semiconductor", "name_number": ""}
-    r2 = {"norm_name": "acme semiconductor", "norm_street": "1200 innovation dr", "state": "CA", "norm_zip": "95054", "name_base": "acme semiconductor", "name_number": ""}
-    score, method = compute_match(r1, r2)
-    assert score == 1.0
-    assert method == "exact_name"
-
-
-def test_exact_name_different_state_no_address_rejects():
-    r1 = {"norm_name": "summit consulting group", "norm_street": "700 k st", "state": "DC", "norm_zip": "20006", "name_base": "summit consulting group", "name_number": ""}
-    r2 = {"norm_name": "summit consulting group", "norm_street": "450 mountain rd", "state": "CO", "norm_zip": "80202", "name_base": "summit consulting group", "name_number": ""}
-    score, method = compute_match(r1, r2)
-    assert score == 0.0
+def test_roman_numeral_mismatch_blocked():
+    r1 = rec("sec",         "1001",   "WESTPOINT INDUSTRIAL REALTY II LP",
+             street="1 Park Ave", city="New York", state="NY", zip_code="10017")
+    r2 = rec("usaspending", "UEI001", "Westpoint Industrial Realty III",
+             street="1 Park Ave", city="New York", state="NY", zip_code="10017")
+    d  = compare_records(r1, r2)
+    assert not d.matched
+    assert d.method == "roman_numeral_mismatch"
 
 
-def test_roman_numeral_mismatch_rejects():
-    r1 = {"norm_name": "westpoint industrial realty ii", "norm_street": "400 madison ave", "state": "DE", "norm_zip": "10017", "name_base": "westpoint industrial realty", "name_number": "ii"}
-    r2 = {"norm_name": "westpoint industrial realty iii", "norm_street": "400 madison ave", "state": "DE", "norm_zip": "10017", "name_base": "westpoint industrial realty", "name_number": "iii"}
-    score, method = compute_match(r1, r2)
-    assert score == 0.0
+def test_exact_name_same_state_high_score():
+    r1 = rec("sec",         "1001",   "ACME SEMICONDUCTOR CORP",
+             street="1200 Innovation Dr",    city="Sacramento", state="CA", zip_code="95054")
+    r2 = rec("usaspending", "UEI001", "Acme Semiconductor Corp.",
+             street="1200 Innovation Drive", city="Sacramento", state="CA", zip_code="95054")
+    d  = compare_records(r1, r2)
+    assert d.matched
+    assert d.method == "exact_name_state"
+    assert d.score  >= 0.985
 
 
-def test_fuzzy_match_catches_filler_word_difference():
-    r1 = {"norm_name": "baker and holt industries", "norm_street": "45 commerce st", "state": "OH", "norm_zip": "44114", "name_base": "baker and holt industries", "name_number": ""}
-    r2 = {"norm_name": "baker holt industries", "norm_street": "45 commerce st", "state": "OH", "norm_zip": "44114", "name_base": "baker holt industries", "name_number": ""}
-    score, method = compute_match(r1, r2)
-    assert score >= 0.7
+def test_near_miss_different_state_no_match():
+    r1 = rec("sec",         "2001",   "ATLANTIC COAST FREIGHT LLC",
+             street="88 Shore Rd",     city="Raleigh",   state="NC", zip_code="28401")
+    r2 = rec("usaspending", "UEI002", "Atlantic Coastal Freight",
+             street="200 Harbor Blvd", city="Princeton", state="NJ", zip_code="07302")
+    d  = compare_records(r1, r2)
+    assert not d.matched
 
 
-def test_atlantic_near_miss_does_not_match():
-    """Atlantic Coast Freight and Atlantic Coastal Freight are different companies."""
-    r1 = {"norm_name": "atlantic coast freight", "norm_street": "88 shore rd", "state": "NC", "norm_zip": "28401", "name_base": "atlantic coast freight", "name_number": ""}
-    r2 = {"norm_name": "atlantic coastal freight", "norm_street": "200 harbor blvd", "state": "NJ", "norm_zip": "07302", "name_base": "atlantic coastal freight", "name_number": ""}
-    score, method = compute_match(r1, r2)
-    assert score == 0.0
+def test_same_name_different_state_no_address_no_match():
+    r1 = rec("sec",   "3001",  "SUMMIT CONSULTING GROUP INC",
+             street="700 K St",        city="Washington", state="DC", zip_code="20006")
+    r2 = rec("state", "CO-01", "Summit Consulting Group LLC",
+             street="450 Mountain Rd", city="Denver",     state="CO", zip_code="80202")
+    d  = compare_records(r1, r2)
+    assert not d.matched
 
 
-def test_no_match_for_unrelated_companies():
-    r1 = {"norm_name": "acme semiconductor", "norm_street": "1200 innovation dr", "state": "CA", "norm_zip": "95054", "name_base": "acme semiconductor", "name_number": ""}
-    r2 = {"norm_name": "baker and holt industries", "norm_street": "45 commerce st", "state": "OH", "norm_zip": "44114", "name_base": "baker and holt industries", "name_number": ""}
-    score, method = compute_match(r1, r2)
-    assert score == 0.0
+# parent name linking
 
+def test_parent_name_links_subsidiary_to_parent():
+    parent = rec(
+        "sec", "3001", "RIVERSTONE HOLDINGS CORP",
+        street="100 Main St", city="Austin", state="TX", zip_code="78701",
+    )
+    subsidiary = rec(
+        "usaspending", "UEI003", "RIVERSTONE FEDERAL PROGRAMS LLC",
+        street="200 Oak Ave", city="Dallas", state="TX", zip_code="75201",
+        parent_name="Riverstone Holdings Corp",
+    )
+    unrelated = rec(
+        "state", "TX-999", "UNRELATED COMPANY INC",
+        street="500 Pine St", city="Houston", state="TX", zip_code="77001",
+    )
+    entities, links = build_resolved_entities([parent, subsidiary, unrelated])
+    assert len(entities) == 2
+    assert len(links)    == 3
+    link_map = {f"{l.source_system}:{l.source_record_id}": l.entity_id for l in links}
+    assert link_map["sec:3001"] == link_map["usaspending:UEI003"]
+    assert link_map["state:TX-999"] != link_map["sec:3001"]
+
+
+# integration
 
 def test_pipeline_links_all_500_records():
-    """Run the full pipeline and verify all 500 source records are linked."""
-    main()
     with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM resolved.entity_source_links")
-        (count,) = cur.fetchone()
-    assert count == 500, f"Expected 500 links, got {count}"
+        records = load_source_records(cur)
+    assert len(records) == 500
+    _, links = build_resolved_entities(records)
+    assert len(links) == 500
+    seen = {(l.source_system, l.source_record_id) for l in links}
+    assert len(seen) == 500

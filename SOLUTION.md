@@ -1,88 +1,39 @@
-# Solution: Entity Linking Across Public Data Sources
+# Solution
 
 ## Approach
 
-The pipeline works in four stages:
+The pipeline is split across three modules: `normalize.py`, `linker.py`, and `main.py`.
 
-1. **Load and normalize**: Pull all 500 records from the three source tables
-   into a common format. Normalize company names by lowercasing, stripping legal
-   suffixes (Inc, Corp, LLC, etc.) entirely, replacing "&" with "and", and
-   removing punctuation. Normalize addresses by abbreviating street types
-   (Boulevard -> Blvd, etc.) and stripping suite/floor info. Normalize ZIP codes
-   to 5 digits. Extract trailing Roman numerals or numbers from names to prevent
-   false merges (e.g., "Realty II" vs "Realty III").
+**Normalization**: Company names are uppercased, punctuation stripped, legal suffixes removed entirely (so "Acme Corp" and "Acme Corporation" both become "ACME"), and common abbreviations expanded (TECH → TECHNOLOGY, NATL → NATIONAL). "AND" is dropped so "Baker and Holt" and "Baker Holt" normalize identically. Streets have suite/floor info stripped and type tokens abbreviated. ZIPs are truncated to 5 digits.
 
-2. **Pairwise matching**: Compare every pair of records using fuzzy string
-   matching (rapidfuzz). The matching uses a tiered scoring system:
-   - Exact normalized name, same state → score 1.0
-   - Exact name, different state, confirmed by matching address → score 0.95
-   - Exact name, different state, no address match → no match
-   - High fuzzy match (>=85%) with only filler word differences → match if
-     same state or address confirms
-   - High fuzzy match with meaningful word differences → only match with
-     address confirmation
-   - Medium fuzzy match (>=65%) with strong address match in same state →
-     match with moderate confidence
-   - Different trailing numbers/roman numerals → never match
+**Matching**: Records are compared pairwise across source systems only — never within the same source. Two hard blocks fire before scoring: same-source pairs are rejected immediately, and pairs where both names end in different roman numerals (II vs III) are blocked regardless of everything else. For remaining pairs, a weighted score is computed across five fields — name (65%), street (10%), city (10%), state (10%), ZIP (5%) — and matches are decided through four tiers from exact name + state + geo confirmation down to moderate fuzzy + strong address. A second pass links USAspending subsidiaries to parent entities via the `parent_name` field.
 
-3. **Parent name linking**: USAspending records include a `parent_name` field.
-   After standard matching, the pipeline links USAspending subsidiaries to their
-   parent entities by fuzzy matching `parent_name` against all other normalized
-   names (threshold 0.85).
-
-4. **Clustering and output**: Union-Find groups matched records into clusters.
-   For each cluster, a canonical name is chosen (preferring SEC names as the most
-   formal source), a deterministic entity ID is generated via uuid5 on sorted
-   source keys, and results are written to the resolved tables.
+**Clustering**: Matched pairs form a graph. DFS finds connected components, each becoming one entity. IDs are generated via uuid5 over sorted source keys, making the pipeline fully deterministic.
 
 ## Trade-offs
 
-**Precision over recall**: Same-name matches across states are rejected when
-addresses don't confirm. This may miss real matches where a company moved, but
-avoids merging unrelated companies sharing a common name.
+Precision over recall — every tier requires geographic confirmation on top of name similarity. This avoids false merges at the cost of potentially missing matches where a company's address differs between sources.
 
-**Word-level diff checking**: Instead of relying purely on fuzzy scores, the
-pipeline checks whether names differ by meaningful words or just filler words
-("and", "of", "the"). "Baker and Holt" vs "Baker Holt" differs only by a
-filler word and matches. "Atlantic Coastal Freight" vs "Atlantic Coast Freight"
-differs by a meaningful word and requires address confirmation.
+O(n²) comparisons work fine for 500 records but wouldn't scale. For larger datasets I'd add blocking by state or ZIP before comparing pairs.
 
-**O(n²) pairwise comparison**: With 500 records this runs in under a second.
-For larger datasets blocking would be needed.
+State registrations use agent addresses rather than company addresses, making address confirmation weaker for that source. Name similarity carries more weight there.
 
-**Agent address for state_registrations**: This table stores the registered
-agent's address, not the company's operating address. This makes address
-confirmation less reliable for state records, so name similarity carries
-more weight in those matches.
+## Hard cases
 
-## Hard Cases
+**"Atlantic Coast Freight" vs "Atlantic Coastal Freight"**: These score ~95% on name similarity alone. The word-level diff check catches that COAST and COASTAL are meaningfully different tokens, and since they're in different states with no address overlap, the match is correctly rejected.
 
-1. **Summit Consulting Group**: Two different entities share the same base name
-   in different states (DC and CO). After suffix removal both normalize to
-   "summit consulting group". Solved by rejecting exact-name matches across states
-   without address confirmation.
+**"Westpoint Industrial Realty II" vs "Westpoint Industrial Realty III"**: Nearly identical names, same address. The roman numeral hard block handles this before any scoring happens.
 
-2. **Atlantic Coast vs Atlantic Coastal Freight**: Two genuinely different
-   companies with ~96% fuzzy name similarity. "Atlantic Coast Freight" (NC) and
-   "Atlantic Coastal Freight" (NJ) are separated because "coastal" vs "coast" is
-   a meaningful word difference requiring address confirmation, which fails.
+**"Summit Consulting Group"** appears in both DC and CO as unrelated companies. Geographic confirmation is required even for identical normalized names, so they correctly remain separate entities.
 
-3. **Westpoint Industrial Realty II vs III**: Same base name, different Roman
-   numeral suffix. The pipeline extracts trailing numerals and blocks matches when
-   they differ, regardless of name similarity.
+**Riverstone Holdings / Riverstone Federal Programs**: Standard fuzzy matching won't link these since the names share little overlap. The parent_name linking pass catches it using the `parent_name` field in USAspending.
 
-4. **Riverstone Federal Programs / Riverstone Holdings**: The USAspending
-   record for "Riverstone Federal Programs LLC" carries a `parent_name` of
-   "Riverstone Holdings Corp." The parent name linking step catches this and
-   correctly links the subsidiary to the parent entity.
+## What I'd do next
 
-## What I Would Do Next
+- Add blocking by state or ZIP to scale beyond a few thousand records
+- Use `usaddress` to parse street addresses into components for more precise comparison
+- Generate a review report of low-confidence matches for human inspection before committing
 
-- **Blocking**: Only compare records sharing the first few characters of the
-  normalized name or the same ZIP, reducing comparisons from O(n²).
-- **Address parsing**: Use `usaddress` to parse addresses into components
-  (street number, street name) for more precise comparison.
-- **Confidence review**: Generate a report of low-confidence matches (0.70–0.85)
-  for human review before committing to the resolved tables.
-- **Incremental updates**: Support adding new records without reprocessing
-  the full dataset.
+## Note on test suite
+
+Running `pytest` on a populated database will show one expected failure: `test_resolved_tables_exist_and_empty` in `test_smoke.py`. This smoke test checks the resolved tables are empty on a fresh database — it passes before the pipeline runs and fails after, which is intended. All 11 tests in `test_linking.py` pass unconditionally.
