@@ -19,3 +19,6 @@ __pycache__/
 # a database that already contains the source tables and seed data. To keep
 # transient runtime files out of the commit, individual subpaths can be
 # ignored here once we settle on what PG writes during normal use.
+postgres-data/
+*.log
+__pycache__/
