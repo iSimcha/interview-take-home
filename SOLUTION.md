@@ -1,79 +1,88 @@
-# Solution Write-Up
+# Solution: Entity Linking Across Public Data Sources
 
 ## Approach
 
-I built a multi-stage entity linking pipeline in Python that normalizes,
-blocks, scores, and clusters records from three source tables into a single
-resolved view.
+The pipeline works in four stages:
 
-**Stage 1 — Normalization**: Before any comparison, all records are normalized
-to remove noise. Company names are lowercased, punctuation stripped, legal
-suffixes standardized (`Inc.` → `inc`, `Corporation` → `corp`), and
-ampersands expanded (`&` → `and`). Street addresses are similarly normalized
-with common abbreviations (`Street` → `st`, `Parkway` → `pkwy`). ZIP codes
-are truncated to 5 digits to handle ZIP+4 variants.
+1. **Load and normalize**: Pull all 500 records from the three source tables
+   into a common format. Normalize company names by lowercasing, stripping legal
+   suffixes (Inc, Corp, LLC, etc.) entirely, replacing "&" with "and", and
+   removing punctuation. Normalize addresses by abbreviating street types
+   (Boulevard -> Blvd, etc.) and stripping suite/floor info. Normalize ZIP codes
+   to 5 digits. Extract trailing Roman numerals or numbers from names to prevent
+   false merges (e.g., "Realty II" vs "Realty III").
 
-**Stage 2 — Blocking**: Rather than comparing all 500 records against each
-other (125,000 pairs), I block by `state`. This reduces comparisons to only
-records in the same state, which is a safe assumption — the same real-world
-company will always be registered in the same state across sources.
+2. **Pairwise matching**: Compare every pair of records using fuzzy string
+   matching (rapidfuzz). The matching uses a tiered scoring system:
+   - Exact normalized name, same state → score 1.0
+   - Exact name, different state, confirmed by matching address → score 0.95
+   - Exact name, different state, no address match → no match
+   - High fuzzy match (>=85%) with only filler word differences → match if
+     same state or address confirms
+   - High fuzzy match with meaningful word differences → only match with
+     address confirmation
+   - Medium fuzzy match (>=65%) with strong address match in same state →
+     match with moderate confidence
+   - Different trailing numbers/roman numerals → never match
 
-**Stage 3 — Scoring**: Each candidate pair within a block is scored using a
-weighted combination of fuzzy string similarity:
+3. **Parent name linking**: USAspending records include a `parent_name` field.
+   After standard matching, the pipeline links USAspending subsidiaries to their
+   parent entities by fuzzy matching `parent_name` against all other normalized
+   names (threshold 0.85).
 
-- Company name similarity (60% weight) — using `rapidfuzz` token sort ratio
-- Street address similarity (25% weight)
-- ZIP code exact match (15% weight)
-
-Pairs scoring ≥ 0.85 are tagged `name_address_high`, pairs between 0.60–0.85
-are tagged `name_address_fuzzy`, and below 0.60 are discarded.
-
-**Stage 4 — Clustering**: Matched pairs are clustered using a union-find
-(disjoint set) data structure. This handles transitive matches — if A matches
-B and B matches C, all three are grouped into one entity. Each cluster gets
-one canonical name (the longest normalized name in the cluster) inserted into
-`resolved.entities`, and every source record gets a row in
-`resolved.entity_source_links`.
+4. **Clustering and output**: Union-Find groups matched records into clusters.
+   For each cluster, a canonical name is chosen (preferring SEC names as the most
+   formal source), a deterministic entity ID is generated via uuid5 on sorted
+   source keys, and results are written to the resolved tables.
 
 ## Trade-offs
 
-**Precision vs. recall**: I tuned the 0.60 threshold conservatively to avoid
-false positives. This means some genuine matches with abbreviated names or
-different addresses may be missed, but avoids merging distinct companies
-incorrectly. For this dataset size, false merges are more damaging than
-missed links.
+**Precision over recall**: Same-name matches across states are rejected when
+addresses don't confirm. This may miss real matches where a company moved, but
+avoids merging unrelated companies sharing a common name.
 
-**Blocking strategy**: Blocking by state is fast and safe but misses cases
-where a company is registered in a different state than it operates in. A
-production system would use multiple blocking keys (e.g., ZIP code, first
-token of name) and take the union.
+**Word-level diff checking**: Instead of relying purely on fuzzy scores, the
+pipeline checks whether names differ by meaningful words or just filler words
+("and", "of", "the"). "Baker and Holt" vs "Baker Holt" differs only by a
+filler word and matches. "Atlantic Coastal Freight" vs "Atlantic Coast Freight"
+differs by a meaningful word and requires address confirmation.
 
-**Address matching for state_registrations**: This table uses agent addresses
-rather than company addresses, making address similarity less reliable. I
-compensate by weighting name similarity higher (60%).
+**O(n²) pairwise comparison**: With 500 records this runs in under a second.
+For larger datasets blocking would be needed.
+
+**Agent address for state_registrations**: This table stores the registered
+agent's address, not the company's operating address. This makes address
+confirmation less reliable for state records, so name similarity carries
+more weight in those matches.
 
 ## Hard Cases
 
-1. **Similar names, different entities**: Companies like `National Services
-Inc` appear in multiple states with identical names but are unrelated
-   businesses. Blocking by state handles this correctly — they never get
-   compared.
+1. **Summit Consulting Group**: Two different entities share the same base name
+   in different states (DC and CO). After suffix removal both normalize to
+   "summit consulting group". Solved by rejecting exact-name matches across states
+   without address confirmation.
 
-2. **Abbreviated vs. full legal names**: `MEADOW CO CORP` vs `Meadow Company
-Corporation` — normalization expands `co` → `co` and `corp` → `corp`
-   consistently, so fuzzy matching correctly identifies these as the same.
+2. **Atlantic Coast vs Atlantic Coastal Freight**: Two genuinely different
+   companies with ~96% fuzzy name similarity. "Atlantic Coast Freight" (NC) and
+   "Atlantic Coastal Freight" (NJ) are separated because "coastal" vs "coast" is
+   a meaningful word difference requiring address confirmation, which fails.
 
-3. **Agent address vs. company address**: `state_registrations` uses the
-   registered agent's address, which may differ from the company's operating
-   address in other sources. For these records, name similarity carries almost
-   all the weight in the match score.
+3. **Westpoint Industrial Realty II vs III**: Same base name, different Roman
+   numeral suffix. The pipeline extracts trailing numerals and blocks matches when
+   they differ, regardless of name similarity.
+
+4. **Riverstone Federal Programs / Riverstone Holdings**: The USAspending
+   record for "Riverstone Federal Programs LLC" carries a `parent_name` of
+   "Riverstone Holdings Corp." The parent name linking step catches this and
+   correctly links the subsidiary to the parent entity.
 
 ## What I Would Do Next
 
-- Add a second blocking pass using ZIP code to catch cross-state matches
-- Use `usaddress` library to parse and normalize street addresses more
-  precisely (extract house number, street name separately)
-- Tune thresholds using a small hand-labeled validation set
-- Replace the flat 0.75 clustered score with the actual pairwise score for
-  each record
-- Add logging to surface low-confidence matches for human review
+- **Blocking**: Only compare records sharing the first few characters of the
+  normalized name or the same ZIP, reducing comparisons from O(n²).
+- **Address parsing**: Use `usaddress` to parse addresses into components
+  (street number, street name) for more precise comparison.
+- **Confidence review**: Generate a report of low-confidence matches (0.70–0.85)
+  for human review before committing to the resolved tables.
+- **Incremental updates**: Support adding new records without reprocessing
+  the full dataset.
